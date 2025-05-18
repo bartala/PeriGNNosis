@@ -1,0 +1,30 @@
+# Core Python libraries
+numpy
+pandas
+requests
+python-dotenv
+
+# PyTorch & PyG (PyTorch Geometric ecosystem)
+torch
+torch-geometric
+pyg-lib
+torch-sparse
+
+# Scikit-learn for ML tasks
+scikit-learn
+
+# LangChain modules (separated for modular installs)
+langchain-core>=0.1.0
+langchain-community>=0.1.0
+langchain-huggingface>=0.1.0
+langchain-ollama>=0.1.0
+langchain-experimental>=0.0.50
+
+# Graph and database
+neo4j
+
+# UI
+gradio>=4.0.0
+
+# Optional: for tokenizer-based splitting
+langchain-text-splitters

@@ -10,6 +10,11 @@ Conclusions: Our findings demonstrate that AI-based computational methods that u
 
 ## Quick start
 
+`ollama_graphRAG.ipynb` - Analyze narratives using LlaMa and build a knowledge graph in Neo4j
+
+`cbex_cbptsd.ipynb` - Analyze the knowledge graph and train a PeriGNNosis
+
+
 ## Miscellaneous
 Please send any questions you might have about the code and/or the algorithm to alon.bartal@biu.ac.il.
 

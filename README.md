@@ -28,15 +28,20 @@ No raw PHI/PII exposure - run locally with your own data
 
 Create and activate your environment (conda or venv).
 
-Run `setup.sh`
+Run `setup.sh` -- Shell script to initialize the environment and install required dependencies.
 
-`pip install -r requirements.txt`
+`pip install -r requirements.txt`  -- Python dependencies for running the PeriGNNosis pipeline (PyTorch, PyG, LangChain, Neo4j, etc.).
 
-Prepare `.env`
+Prepare `.env` -- Template file for environment variables. Copy to .env and fill in your Neo4j credentials, database name, and local paths.
 
-`ollama_graphRAG.ipynb` - Analyze narratives using LlaMa 3.1-8B and build a knowledge graph in Neo4j
+`ollama_graphRAG.ipynb` -- Analyze narratives using LlaMa 3.1-8B and build a knowledge graph in Neo4j
+Notebook integrating Ollama + LangChain for graph-augmented retrieval (GraphRAG).
+Uses LLMs to extract entities/relations from text.
+Populates Neo4j with narrative data.
+Demonstrates querying the KG with natural language prompts.
+Explores how retrieval-augmented generation can assist with explainability and interactive analysis.
 
-Run `cbex_cbptsd.ipynb` - 
+Run `cbex_cbptsd.ipynb` -- 
 This script builds a heterogeneous knowledge graph (KG) from Neo4j, assembles document-level features (narrative embeddings, degree, obstetric complications, Peritraumatic Distress Inventory items), and trains a heterogeneous GraphSAGE classifier to detect childbirth-related PTSD (CB-PTSD). It also includes a feature ablation routine.
 
 Outputs:

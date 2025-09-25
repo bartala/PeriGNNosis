@@ -12,7 +12,7 @@ PeriGNNosis demonstrates a  scalable, patient-centered approach for CB-PTSD dete
 
 ## Quick start
 
-`ollama_graphRAG.ipynb` - Analyze narratives using LlaMa and build a knowledge graph in Neo4j
+`ollama_graphRAG.ipynb` - Analyze narratives using LlaMa 3.1-8B and build a knowledge graph in Neo4j
 
 `cbex_cbptsd.ipynb` - Analyze the knowledge graph and train PeriGNNosis
 

@@ -1,17 +1,19 @@
 # Core Python libraries
-numpy
-pandas
-requests
-python-dotenv
+numpy>=1.24,<2.0
+pandas>=2.0,<3.0
+requests>=2.31,<3.0
+python-dotenv>=1.0,<2.0
 
 # PyTorch & PyG (PyTorch Geometric ecosystem)
-torch
-torch-geometric
-pyg-lib
-torch-sparse
+torch==2.2.2          # LTS/stable release (CUDA 12.1)
+torch-geometric==2.5.3
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+pyg-lib==0.4.0
+
 
 # Scikit-learn for ML tasks
-scikit-learn
+scikit-learn>=1.3,<1.6
 
 # LangChain modules (separated for modular installs)
 langchain-core>=0.1.0
@@ -21,7 +23,7 @@ langchain-ollama>=0.1.0
 langchain-experimental>=0.0.50
 
 # Graph and database
-neo4j
+neo4j>=5.15,<6.0
 
 # UI
 gradio>=4.0.0

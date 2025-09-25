@@ -28,6 +28,8 @@ No raw PHI/PII exposure - run locally with your own data
 
 Create and activate your environment (conda or venv).
 
+Run `setup.sh`
+
 `pip install -r requirements.txt`
 
 Prepare `.env`

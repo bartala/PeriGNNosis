@@ -135,7 +135,7 @@ ax1.set_yticklabels([]) # Ensure y-labels are hidden for ax1
 ax2 = fig.add_subplot(gs[0, 1])
 
 # Filter out the least frequent relation type for Figure (b)
-edges_filtered = edges.iloc[7:].copy() # Exclude the first TWO rows (least frequent) for more space
+edges_filtered = edges.iloc[2:].copy() # Exclude the first TWO rows (least frequent) for more space
 
 lollipop_standard(ax2, edges_filtered["label"], edges_filtered["logfreq"], xmax)
 ax2.set_xlabel("Log10(Frequency)")

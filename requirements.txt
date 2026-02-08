@@ -1,27 +1,27 @@
 # Core scientific stack
-numpy
-pandas
-scikit-learn
-tqdm
+numpy~=1.26
+pandas~=2.2
+scikit-learn~=1.4
+tqdm~=4.66
 
 # Deep learning
-torch
-torch-geometric
+torch~=2.2
+torch-geometric~=2.5
 
 # Knowledge graph
-neo4j
-py2neo
+neo4j~=5.18
+py2neo~=2021.2
 
 # LLM and NLP
-sentence-transformers
-langchain
-langchain-community
-langchain-experimental
-langchain-ollama
+sentence-transformers~=2.6
+langchain~=0.1
+langchain-community~=0.0.30
+langchain-experimental~=0.0.50
+langchain-ollama~=0.1
 
-# Visualization (figures and analysis)
-matplotlib
-seaborn
+# Visualization
+matplotlib~=3.8
+seaborn~=0.13
 
-# Utility
-python-dotenv
+# Utilities
+python-dotenv~=1.0

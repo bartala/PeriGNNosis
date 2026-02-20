@@ -1,0 +1,311 @@
+import os
+import gc
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+# Removed 'from scipy import interp' (Deprecated)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric.transforms as T
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import GATConv, HeteroConv, LayerNorm
+
+from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+CONFIG = {
+    "SEED": 42,
+    "OUTER_FOLDS": 5,
+    "GAT_HEADS": 4,
+    
+    # 1. Linear Models Grid
+    "LINEAR_GRID": {"clf__C": [0.01, 0.1, 1, 10, 100]},
+    
+    # 2. Neural Models Grid (Model Params + Optimizer Params)
+    "NN_GRID": {
+        "hidden_channels": [32, 64],
+        "dropout": [0.0, 0.3],
+        "lr": [1e-3, 5e-4] 
+    },
+    
+    "NN_EPOCHS": 30,       
+    "TUNE_EPOCHS": 15,     
+    "WEIGHT_DECAY": 1e-2,
+}
+
+EMB_DIM = 768
+PDI_DIM = 13
+COMP_DIM = 1
+TOTAL_DIM = EMB_DIM + PDI_DIM + COMP_DIM 
+
+# ==============================================================================
+# UTILS
+# ==============================================================================
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+
+def cleanup():
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    gc.collect()
+
+def sanitize_and_fix_graph(raw):
+    raw = raw.cpu()
+    node_map = {nt: (nt.replace(" ", "_").replace("-", "_") if nt != "__Entity__" else "Entity") for nt in raw.node_types}
+    temp = HeteroData()
+    for nt, new_nt in node_map.items():
+        if "x" in raw[nt] and raw[nt].x is not None:
+            temp[new_nt].x = raw[nt].x
+            temp[new_nt].num_nodes = int(raw[nt].x.size(0))
+        else:
+            temp[new_nt].num_nodes = int(raw[nt].num_nodes) if getattr(raw[nt], 'num_nodes', None) else 0
+        if "y" in raw[nt]: temp[new_nt].y = raw[nt].y
+    
+    woman_key = node_map["Woman"]
+    for (src, rel, dst) in raw.edge_types:
+        temp[node_map[src], rel.replace(" ", "_"), node_map[dst]].edge_index = raw[src, rel, dst].edge_index
+    
+    data = T.ToUndirected()(temp)
+    
+    for nt in data.node_types:
+        target_dim = TOTAL_DIM if nt == woman_key else EMB_DIM
+        if "x" not in data[nt]: 
+            data[nt].x = torch.zeros((data[nt].num_nodes, target_dim), dtype=torch.float32)
+        else:
+            x = data[nt].x
+            if x.size(1) < target_dim:
+                pad = torch.zeros((data[nt].num_nodes, target_dim - x.size(1)), dtype=x.dtype, device=x.device)
+                data[nt].x = torch.cat([x, pad], dim=1)
+            else:
+                data[nt].x = x[:, :target_dim]
+                
+    for (s, r, d) in data.edge_types:
+        ei = data[s, r, d].edge_index
+        if ei is not None and ei.numel() > 0:
+            mask = (ei[0] >= 0) & (ei[0] < data[s].num_nodes) & (ei[1] >= 0) & (ei[1] < data[d].num_nodes)
+            data[s, r, d].edge_index = ei[:, mask]
+            
+    return data, woman_key
+
+def block_edges(data, blocked_idx, woman_key):
+    data = data.clone()
+    blocked = torch.zeros(data[woman_key].num_nodes, dtype=torch.bool)
+    blocked[torch.as_tensor(blocked_idx, dtype=torch.long)] = True
+    for (src, rel, dst) in data.edge_types:
+        if src == woman_key:
+            ei = data[src, rel, dst].edge_index
+            data[src, rel, dst].edge_index = ei[:, ~blocked[ei[0]]]
+    return data
+
+# ==============================================================================
+# MODELS
+# ==============================================================================
+class HeteroGAT(nn.Module):
+    def __init__(self, metadata, woman_key, hidden_channels=64, out_channels=2, heads=4, dropout=0.0):
+        super().__init__()
+        self.woman_key = woman_key
+        node_types, edge_types = metadata
+        self.dropout = dropout
+        self.encoder = nn.ModuleDict({nt: nn.Linear(TOTAL_DIM if nt == woman_key else EMB_DIM, hidden_channels) for nt in node_types})
+        self.norms = nn.ModuleDict({nt: LayerNorm(hidden_channels) for nt in node_types})
+        self.conv1 = HeteroConv({et: GATConv(hidden_channels, hidden_channels, heads=heads, concat=False, add_self_loops=False) for et in edge_types}, aggr="sum")
+        self.conv2 = HeteroConv({et: GATConv(hidden_channels, hidden_channels, heads=1, concat=False, add_self_loops=False) for et in edge_types}, aggr="sum")
+        self.res_lin = nn.Linear(hidden_channels, hidden_channels)
+        self.lin = nn.Linear(hidden_channels + PDI_DIM + COMP_DIM, out_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x_dict, edge_index_dict):
+        raw_woman = x_dict[self.woman_key]
+        clinical = raw_woman[:, EMB_DIM:]
+        x_dict = {nt: self.norms[nt](self.encoder[nt](x)) for nt, x in x_dict.items()}
+        h_init = x_dict[self.woman_key]
+        x1 = self.conv1(x_dict, edge_index_dict)
+        x1 = {k: F.dropout(self.relu(x1.get(k, x_dict[k])), p=self.dropout, training=self.training) for k in x_dict.keys()}
+        x2 = self.conv2(x1, edge_index_dict)
+        x2_woman = F.dropout(self.relu(x2.get(self.woman_key, x1[self.woman_key])), p=self.dropout, training=self.training)
+        return self.lin(torch.cat([x2_woman + self.res_lin(h_init), clinical], dim=-1))
+
+class FFNN(nn.Module):
+    def __init__(self, woman_key, hidden_channels=64, out=2, dropout=0.0):
+        super().__init__()
+        self.woman_key = woman_key
+        self.net = nn.Sequential(
+            nn.Linear(TOTAL_DIM, hidden_channels), nn.LayerNorm(hidden_channels), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_channels, out)
+        )
+    def forward(self, x_dict, edge_index_dict=None):
+        return self.net(x_dict[self.woman_key])
+
+def train_epoch(model, g, train_idx, y_torch, optimizer):
+    model.train(); optimizer.zero_grad()
+    loss = F.cross_entropy(model(g.x_dict, g.edge_index_dict)[train_idx], y_torch[train_idx])
+    loss.backward(); optimizer.step()
+
+@torch.no_grad()
+def evaluate(model, g, idx, y_torch):
+    model.eval()
+    probs = F.softmax(model(g.x_dict, g.edge_index_dict)[idx], dim=1)[:, 1].cpu().numpy()
+    if len(np.unique(y_torch[idx].cpu().numpy())) < 2: return 0.5
+    return roc_auc_score(y_torch[idx].cpu().numpy(), probs)
+
+# ==============================================================================
+# TUNING ENGINE
+# ==============================================================================
+def tune_and_train_nn(model_class, g, train_idx, test_idx, y_torch, device, woman_key):
+    # 1. Internal Tuning Split
+    tr_sub, val_sub = train_test_split(train_idx, test_size=0.2, stratify=y_torch[train_idx].cpu(), random_state=CONFIG["SEED"])
+    tr_t, val_t = torch.as_tensor(tr_sub, device=device), torch.as_tensor(val_sub, device=device)
+    
+    # 2. Grid Search
+    import itertools
+    keys, values = zip(*CONFIG["NN_GRID"].items())
+    best_auc, best_config = -1, {}
+    
+    for v in itertools.product(*values):
+        full_params = dict(zip(keys, v))
+        lr = full_params['lr']
+        model_params = {k: v for k, v in full_params.items() if k != 'lr'}
+        
+        if model_class == HeteroGAT:
+            model = model_class(g.metadata(), woman_key, **model_params).to(device)
+        else:
+            model = model_class(woman_key, **model_params).to(device)
+            
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=CONFIG["WEIGHT_DECAY"])
+        for _ in range(CONFIG["TUNE_EPOCHS"]): train_epoch(model, g, tr_t, y_torch, opt)
+        auc_val = evaluate(model, g, val_t, y_torch)
+        
+        if auc_val > best_auc: best_auc, best_config = auc_val, full_params
+        del model, opt; cleanup()
+        
+    # 3. Final Train
+    final_lr = best_config['lr']
+    final_model_params = {k: v for k, v in best_config.items() if k != 'lr'}
+    
+    full_tr = torch.as_tensor(train_idx, device=device)
+    if model_class == HeteroGAT:
+        model = model_class(g.metadata(), woman_key, **final_model_params).to(device)
+    else:
+        model = model_class(woman_key, **final_model_params).to(device)
+        
+    opt = torch.optim.AdamW(model.parameters(), lr=final_lr, weight_decay=CONFIG["WEIGHT_DECAY"])
+    for _ in range(CONFIG["NN_EPOCHS"]): train_epoch(model, g, full_tr, y_torch, opt)
+    
+    # 4. Predict
+    te_t = torch.as_tensor(test_idx, device=device)
+    probs = F.softmax(model(g.x_dict, g.edge_index_dict)[te_t], dim=1)[:, 1].detach().cpu().numpy()
+    del model; cleanup()
+    return probs
+
+# ==============================================================================
+# STATS (DELONG)
+# ==============================================================================
+def run_delong_test(y_true, probs_a, probs_b):
+    n_bootstraps = 2000
+    rng = np.random.RandomState(42)
+    y_true = np.array(y_true)
+    probs_a, probs_b = np.array(probs_a), np.array(probs_b)
+    
+    true_diff = roc_auc_score(y_true, probs_a) - roc_auc_score(y_true, probs_b)
+    diffs = []
+    indices = np.arange(len(y_true))
+    
+    for _ in range(n_bootstraps):
+        idx = rng.choice(indices, len(indices), replace=True)
+        if len(np.unique(y_true[idx])) < 2: continue
+        diffs.append(roc_auc_score(y_true[idx], probs_a[idx]) - roc_auc_score(y_true[idx], probs_b[idx]))
+        
+    std_err = np.std(diffs)
+    z = true_diff / (std_err + 1e-8)
+    p_val = 2 * (1 - stats.norm.cdf(abs(z)))
+    return p_val, true_diff
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main_benchmark(path, out_dir="final_benchmark_optimized"):
+    set_seed(CONFIG["SEED"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Starting Optimized Benchmark on {device}...")
+    
+    os.makedirs(out_dir, exist_ok=True)
+    data, woman_key = sanitize_and_fix_graph(torch.load(path, map_location="cpu", weights_only=False))
+
+    y_all = data[woman_key].y.view(-1).numpy().astype(int)
+    y_torch = torch.as_tensor(y_all, dtype=torch.long, device=device)
+    X_cpu = data[woman_key].x.cpu().numpy()
+    skf = StratifiedKFold(n_splits=CONFIG["OUTER_FOLDS"], shuffle=True, random_state=CONFIG["SEED"])
+
+    model_list = ["PeriGNNosis", "FFNN (Fusion)", "FFNN (PDI Only)", "FFNN (Text Only)", "LR (Fusion)", "SVM (Fusion)"]
+    full_probs = {m: [] for m in model_list}
+    full_y_true = []
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(y_all, y_all)):
+        print(f"Fold {fold+1}/{CONFIG['OUTER_FOLDS']}...")
+        fold_seed = CONFIG["SEED"] + fold
+        set_seed(fold_seed)
+        outer_safe = block_edges(data, test_idx, woman_key)
+        full_y_true.extend(y_all[test_idx])
+        
+        # Neural Models (Tuned)
+        for m_name in [m for m in model_list if "FFNN" in m or "PeriGNNosis" in m]:
+            g_fold = outer_safe.clone().to(device)
+            if "PDI Only" in m_name: g_fold[woman_key].x[:, :EMB_DIM] = 0
+            elif "Text Only" in m_name: g_fold[woman_key].x[:, EMB_DIM:] = 0
+            cls = HeteroGAT if "PeriGNNosis" in m_name else FFNN
+            full_probs[m_name].extend(tune_and_train_nn(cls, g_fold, train_idx, test_idx, y_torch, device, woman_key))
+            del g_fold; cleanup()
+
+        # Linear Models (GridSearchCV)
+        for m_name in ["LR (Fusion)", "SVM (Fusion)"]:
+            clf = LogisticRegression(class_weight="balanced", solver="liblinear", random_state=fold_seed) if "LR" in m_name else SVC(probability=True, class_weight="balanced", random_state=fold_seed)
+            gs = GridSearchCV(Pipeline([("scaler", StandardScaler()), ("clf", clf)]), CONFIG["LINEAR_GRID"], scoring="roc_auc", cv=3, n_jobs=-1)
+            gs.fit(X_cpu[train_idx], y_all[train_idx])
+            full_probs[m_name].extend(gs.predict_proba(X_cpu[test_idx])[:, 1])
+
+    # Save
+    df_res = pd.DataFrame(full_probs); df_res["y_true"] = full_y_true
+    df_res.to_csv(os.path.join(out_dir, "benchmark_predictions.csv"), index=False)
+
+    # DeLong
+    print("\n=== Statistical Significance (DeLong Surrogate) ===")
+    target = "PeriGNNosis"
+    for m in model_list:
+        if m == target: continue
+        p_val, diff = run_delong_test(full_y_true, full_probs[target], full_probs[m])
+        print(f"  vs {m:<18}: p={p_val:.4f} (Delta AUC={diff:.4f})")
+
+    # Plot
+    plt.figure(figsize=(10, 8), dpi=300)
+    palette = {"PeriGNNosis": "#002060", "FFNN (Fusion)": "#ED7D31", "FFNN (Text Only)": "#70AD47", "FFNN (PDI Only)": "#FFC000", "LR (Fusion)": "#5B9BD5", "SVM (Fusion)": "#A5A5A5"}
+    
+    results = []
+    for m in model_list:
+        fpr, tpr, _ = roc_curve(full_y_true, full_probs[m])
+        score = auc(fpr, tpr)
+        results.append({"Model": m, "AUC": score})
+        plt.plot(fpr, tpr, color=palette.get(m, "black"), lw=2.5 if "Peri" in m else 1.5, label=f"{m} ({score:.3f})")
+        
+    plt.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.5); plt.legend(loc="lower right")
+    plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate'); plt.title('Figure 1: Final Optimized ROC Comparison')
+    plt.savefig(os.path.join(out_dir, "ROC_Benchmark.png"))
+    
+    print("\n" + pd.DataFrame(results).sort_values("AUC", ascending=False).to_string(index=False))
+
+if __name__ == "__main__":
+    path = os.path.join(PTH, "graphRAG/data/perignnosis_graph.pt") if "PTH" in globals() else "perignnosis_graph.pt"
+    if os.path.exists(path): main_benchmark(path)

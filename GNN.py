@@ -4,7 +4,7 @@ import json
 import random
 import numpy as np
 import pandas as pd
-import scipy.stats as stats
+import scipy.stats as stats  # (kept; no longer used for AUC test, but harmless)
 
 import torch
 import torch.nn as nn
@@ -25,8 +25,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-
-PTH ='/.../Postpartum_depression/'
+PTH = '/.../Postpartum_depression/'
 
 # ==============================================================================
 # CONFIG (Stable Base)
@@ -39,9 +38,9 @@ CONFIG = {
     # training
     "INNER_EPOCHS": 10,
     "OUTER_EPOCHS": 25,
-    "HIDDEN_CHANNELS": 64,   # Reverted to 64 for stability
+    "HIDDEN_CHANNELS": 64,
     "LR": 5e-4,
-    "WEIGHT_DECAY": 1e-2,    # Reverted to 1e-2
+    "WEIGHT_DECAY": 1e-2,
     "GAT_HEADS": 4,
 
     # baselines
@@ -94,7 +93,8 @@ def to_jsonable(obj):
 def find_threshold_from_oof(y_true, p, method="f1") -> float:
     y_true, p = np.asarray(y_true).astype(int), np.asarray(p).astype(float)
     precision, recall, thresholds = precision_recall_curve(y_true, p)
-    if thresholds.size == 0: return 0.5
+    if thresholds.size == 0:
+        return 0.5
     if method == "f1":
         f1s = (2 * precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-12)
         return float(thresholds[int(np.argmax(f1s))])
@@ -111,42 +111,74 @@ def summarize_at_threshold(y_true, p, thr: float) -> dict:
     spec = tn / (tn + fp + 1e-12)
     prec = tp / (tp + fp + 1e-12)
     return {
-        "threshold": float(thr), "auc": safe_auc(y_true, p), "f1": float(f1_score(y_true, y_hat)),
-        "sensitivity": float(sens), "specificity": float(spec), "precision": float(prec), "recall": float(sens),
+        "threshold": float(thr),
+        "auc": safe_auc(y_true, p),
+        "f1": float(f1_score(y_true, y_hat)),
+        "sensitivity": float(sens),
+        "specificity": float(spec),
+        "precision": float(prec),
+        "recall": float(sens),
         "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
     }
 
-def bootstrap_auc_difference(y_true, p1, p2, name1="Model 1", name2="Model 2", n_bootstraps=2000):
-    y_true, p1, p2 = np.asarray(y_true).astype(int), np.asarray(p1).astype(float), np.asarray(p2).astype(float)
-    auc1, auc2 = roc_auc_score(y_true, p1), roc_auc_score(y_true, p2)
-    diff = auc1 - auc2
-    
+# ==============================================================================
+# STEP A.1: STATISTICAL SIGNIFICANCE ON PAIRED OOF PREDICTIONS
+# Paired permutation test for AUC difference (recommended for OOF/CV setting)
+# ==============================================================================
+def paired_permutation_auc_test(
+    y_true, p1, p2, name1="Model 1", name2="Model 2",
+    n_perm=10000, seed=42
+):
+    """
+    Paired permutation test for difference in AUC on paired (OOF) predictions.
+    Null: models are exchangeable within-subject.
+    Procedure: randomly swap (p1_i, p2_i) per subject with prob 0.5, recompute ΔAUC.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    p1 = np.asarray(p1).astype(float)
+    p2 = np.asarray(p2).astype(float)
+
+    # Observed AUCs and difference
+    auc1 = roc_auc_score(y_true, p1)
+    auc2 = roc_auc_score(y_true, p2)
+    diff_obs = auc1 - auc2
+
+    rng = np.random.RandomState(seed)
+    diffs = np.empty(n_perm, dtype=float)
+
+    for b in range(n_perm):
+        swap = rng.rand(len(y_true)) < 0.5
+        pp1 = p1.copy()
+        pp2 = p2.copy()
+        pp1[swap], pp2[swap] = p2[swap], p1[swap]
+        diffs[b] = roc_auc_score(y_true, pp1) - roc_auc_score(y_true, pp2)
+
+    # Two-sided p-value with +1 smoothing
+    p_value = (np.sum(np.abs(diffs) >= abs(diff_obs)) + 1) / (n_perm + 1)
+
+    # Descriptive 95% interval under permutation distribution (not a frequentist CI for true Δ)
+    ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])
+
     print("\n" + "="*60)
-    print("STEP A.1: STATISTICAL SIGNIFICANCE (DeLong Surrogate)")
+    print("STEP A.1: STATISTICAL SIGNIFICANCE (Paired Permutation Test)")
     print("="*60)
     print(f"{name1:<12} AUC: {auc1:.4f}")
     print(f"{name2:<12} AUC: {auc2:.4f}")
-    print(f"Difference:       {diff:.4f}")
-
-    rng = np.random.RandomState(42)
-    boot_diffs = []
-    indices = np.arange(len(y_true))
-    
-    for _ in range(n_bootstraps):
-        sub_idx = rng.choice(indices, size=len(indices), replace=True)
-        if len(np.unique(y_true[sub_idx])) < 2: continue
-        boot_diffs.append(roc_auc_score(y_true[sub_idx], p1[sub_idx]) - roc_auc_score(y_true[sub_idx], p2[sub_idx]))
-    
-    std_err = np.std(boot_diffs)
-    z_score = diff / (std_err + 1e-12)
-    p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
-    
-    print(f"P-value:          {p_value:.4f} (Z-score: {z_score:.4f}, SE: {std_err:.5f})")
+    print(f"Difference:       {diff_obs:.4f}")
+    print(f"Permutation p:    {p_value:.4g} (n={n_perm}, seed={seed})")
+    print(f"Perm ΔAUC 95%:    [{ci_low:.4f}, {ci_high:.4f}]")
     if p_value < 0.05:
-        print(f">>> RESULT: SIGNIFICANT (p < 0.05). {name1 if diff > 0 else name2} is superior.")
+        print(f">>> RESULT: SIGNIFICANT (p < 0.05). {name1 if diff_obs > 0 else name2} is superior.")
     else:
-        print(">>> RESULT: NOT SIGNIFICANT (p >= 0.05). Performance gap is statistical noise.")
+        print(">>> RESULT: NOT SIGNIFICANT (p >= 0.05).")
     print("="*60 + "\n")
+
+    return {
+        "auc1": float(auc1), "auc2": float(auc2), "diff": float(diff_obs),
+        "p_value": float(p_value), "perm_low": float(ci_low), "perm_high": float(ci_high),
+        "n_perm": int(n_perm), "seed": int(seed),
+        "name1": name1, "name2": name2
+    }
 
 # ==============================================================================
 # GRAPH SANITIZATION + LEAKAGE BLOCK
@@ -157,10 +189,12 @@ def validate_and_fix_edge_index(data: HeteroData) -> HeteroData:
             data[et].edge_index = torch.empty((2, 0), dtype=torch.long)
             continue
         ei = data[et].edge_index
-        if not torch.is_tensor(ei): ei = torch.as_tensor(ei)
+        if not torch.is_tensor(ei):
+            ei = torch.as_tensor(ei)
         ei = ei.long().contiguous()
         if ei.dim() == 1:
-            if ei.numel() % 2 != 0: ei = ei[:-1]
+            if ei.numel() % 2 != 0:
+                ei = ei[:-1]
             ei = ei.view(2, -1)
         data[et].edge_index = ei
     return data
@@ -194,7 +228,8 @@ def sanitize_and_fix_graph(raw: HeteroData):
             data[nt].x = torch.zeros((data[nt].num_nodes, target_dim), dtype=torch.float32)
         else:
             x = data[nt].x
-            if x.dim() != 2: raise ValueError(f"{nt}.x must be 2D, got shape {tuple(x.shape)}")
+            if x.dim() != 2:
+                raise ValueError(f"{nt}.x must be 2D, got shape {tuple(x.shape)}")
             curr_dim = x.size(1)
             if curr_dim < target_dim:
                 pad = torch.zeros((data[nt].num_nodes, target_dim - curr_dim), dtype=x.dtype, device=x.device)
@@ -204,8 +239,12 @@ def sanitize_and_fix_graph(raw: HeteroData):
 
     for (src, rel, dst) in data.edge_types:
         ei = data[src, rel, dst].edge_index
-        if ei is None or ei.numel() == 0: continue
-        mask = ((ei[0] >= 0) & (ei[0] < data[src].num_nodes) & (ei[1] >= 0) & (ei[1] < data[dst].num_nodes))
+        if ei is None or ei.numel() == 0:
+            continue
+        mask = (
+            (ei[0] >= 0) & (ei[0] < data[src].num_nodes) &
+            (ei[1] >= 0) & (ei[1] < data[dst].num_nodes)
+        )
         data[src, rel, dst].edge_index = ei[:, mask]
 
     return data, woman_key
@@ -216,18 +255,21 @@ def block_women_outgoing_edges(data: HeteroData, blocked_idx, woman_key: str) ->
     blocked[torch.as_tensor(blocked_idx, dtype=torch.long)] = True
 
     for (src, rel, dst) in data.edge_types:
-        if src != woman_key: continue
+        if src != woman_key:
+            continue
         ei = data[src, rel, dst].edge_index
-        if ei is None or ei.numel() == 0: continue
+        if ei is None or ei.numel() == 0:
+            continue
         data[src, rel, dst].edge_index = ei[:, ~blocked[ei[0]]]
 
     return data
 
 def apply_pdi_mask_inplace(data: HeteroData, woman_key: str, selected_pdis):
-    if selected_pdis is None: return data
+    if selected_pdis is None:
+        return data
     selected_pdis = [int(i) for i in selected_pdis]
     x = data[woman_key].x
-    
+
     pdi_start, pdi_end = EMB_DIM, EMB_DIM + PDI_DIM
     keep_mask = torch.zeros(PDI_DIM, dtype=torch.bool, device=x.device)
     keep_mask[torch.as_tensor(selected_pdis, dtype=torch.long, device=x.device)] = True
@@ -257,7 +299,7 @@ class HeteroGAT(nn.Module):
             for nt in node_types
         })
         self.norms = nn.ModuleDict({nt: LayerNorm(hidden_channels) for nt in node_types})
-        
+
         self.conv1 = HeteroConv({
             et: GATConv(hidden_channels, hidden_channels, heads=heads, concat=False, add_self_loops=False)
             for et in edge_types
@@ -269,15 +311,14 @@ class HeteroGAT(nn.Module):
         }, aggr="sum")
 
         self.res_lin = nn.Linear(hidden_channels, hidden_channels)
-        
+
         self.lin = nn.Linear(hidden_channels + PDI_DIM + COMP_DIM, out_channels)
         self.relu = nn.ReLU()
 
     def forward(self, x_dict, edge_index_dict):
         # 1. Isolate the raw clinical features (PDI + Complication) before message passing
-        # This will correctly capture the features *after* Step B has applied its masking
         raw_woman = x_dict[self.woman_key]
-        clinical_features = raw_woman[:, EMB_DIM:] # Shape: [N, 14]
+        clinical_features = raw_woman[:, EMB_DIM:]  # Shape: [N, 14]
 
         # 2. Standard Encoding
         h_dict = {nt: self.norms[nt](self.encoder[nt](x)) for nt, x in x_dict.items()}
@@ -295,7 +336,7 @@ class HeteroGAT(nn.Module):
 
         # 5. LATE FUSION: Concatenate graph context with exact clinical features
         out = torch.cat([graph_context, clinical_features], dim=-1)
-        
+
         return self.lin(out)
 
 class WomanMLP(nn.Module):
@@ -312,8 +353,10 @@ class WomanMLP(nn.Module):
         return self.net(x_dict[self.woman_key])
 
 def build_model(model_name, metadata, woman_key):
-    if model_name == "GNN": return HeteroGAT(metadata, woman_key, CONFIG["HIDDEN_CHANNELS"], 2, CONFIG["GAT_HEADS"])
-    if model_name == "FFNN": return WomanMLP(woman_key, CONFIG["HIDDEN_CHANNELS"], 2)
+    if model_name == "GNN":
+        return HeteroGAT(metadata, woman_key, CONFIG["HIDDEN_CHANNELS"], 2, CONFIG["GAT_HEADS"])
+    if model_name == "FFNN":
+        return WomanMLP(woman_key, CONFIG["HIDDEN_CHANNELS"], 2)
     raise ValueError(f"Unknown model_name: {model_name}")
 
 # ==============================================================================
@@ -357,18 +400,34 @@ def stepA_model_selection(data, woman_key, device, out_dir):
             p_test = train_and_predict(model, g, train_idx, test_idx, y_torch, device, CONFIG["OUTER_EPOCHS"])
             aucs[m].append(safe_auc(y_all[test_idx], p_test))
             oof_probs[m][test_idx] = p_test
-            del model, g; cleanup()
+            del model, g
+            cleanup()
 
         for m in ["LR-Fusion", "SVM-Fusion"]:
             kind = "LR" if "LR" in m else "SVM"
-            clf = LogisticRegression(class_weight="balanced", solver="liblinear", random_state=fold_seed) if kind == "LR" else SVC(probability=True, class_weight="balanced", random_state=fold_seed)
+            clf = (
+                LogisticRegression(class_weight="balanced", solver="liblinear", random_state=fold_seed)
+                if kind == "LR"
+                else SVC(probability=True, class_weight="balanced", random_state=fold_seed)
+            )
             inner_cv = StratifiedKFold(n_splits=CONFIG["INNER_FOLDS"], shuffle=True, random_state=fold_seed)
-            gs = GridSearchCV(Pipeline([("scaler", StandardScaler()), ("clf", clf)]), {"clf__C": CONFIG["C_GRID"]}, scoring="roc_auc", cv=inner_cv, n_jobs=-1, refit=True).fit(X_cpu[train_idx], y_all[train_idx])
+            gs = GridSearchCV(
+                Pipeline([("scaler", StandardScaler()), ("clf", clf)]),
+                {"clf__C": CONFIG["C_GRID"]},
+                scoring="roc_auc",
+                cv=inner_cv,
+                n_jobs=-1,
+                refit=True
+            ).fit(X_cpu[train_idx], y_all[train_idx])
             p_test = gs.best_estimator_.predict_proba(X_cpu[test_idx])[:, 1]
             aucs[m].append(safe_auc(y_all[test_idx], p_test))
             oof_probs[m][test_idx] = p_test
 
-    summary = pd.DataFrame({"model": model_names, "mean_auc": [float(np.mean(aucs[m])) for m in model_names]}).sort_values("mean_auc", ascending=False).reset_index(drop=True)
+    summary = (
+        pd.DataFrame({"model": model_names, "mean_auc": [float(np.mean(aucs[m])) for m in model_names]})
+        .sort_values("mean_auc", ascending=False)
+        .reset_index(drop=True)
+    )
     best_model = summary.loc[0, "model"]
 
     os.makedirs(out_dir, exist_ok=True)
@@ -393,6 +452,8 @@ def pick_best_k_on_outer_train(best_model_name, outer_safe_graph, woman_key, tra
     k_scores = {k: [] for k in range(1, PDI_DIM + 1)}
     X_woman_cpu = outer_safe_graph[woman_key].x.cpu().numpy()
 
+    y_all_torch = torch.as_tensor(y_all, dtype=torch.long, device=device)
+
     for inner_id, (itr, ival) in enumerate(inner.split(train_idx, y_all[train_idx])):
         set_seed(seed + 100 + inner_id)
         tr_glob, val_glob = train_idx[itr], train_idx[ival]
@@ -402,22 +463,27 @@ def pick_best_k_on_outer_train(best_model_name, outer_safe_graph, woman_key, tra
         for k in range(1, PDI_DIM + 1):
             g = apply_pdi_mask_inplace(inner_safe, woman_key, pdi_rank[:k]).clone().to(device)
             model = build_model(best_model_name, g.metadata(), woman_key).to(device)
-            p_val = train_and_predict(model, g, tr_glob, val_glob, torch.as_tensor(y_all, dtype=torch.long, device=device), device, CONFIG["INNER_EPOCHS"])
+            p_val = train_and_predict(model, g, tr_glob, val_glob, y_all_torch, device, CONFIG["INNER_EPOCHS"])
             k_scores[k].append(safe_auc(y_all[val_glob], p_val))
-            del model, g; cleanup()
+            del model, g
+            cleanup()
 
     mean_scores = {k: float(np.mean(v)) for k, v in k_scores.items()}
     best_k = max(mean_scores.keys(), key=lambda kk: mean_scores[kk])
     full_rank = rank_pdis_by_inner_train_auc(y_all[train_idx], X_woman_cpu[train_idx])
-    
-    return full_rank[:best_k], {"best_k": int(best_k), "mean_auc_by_k": {int(k): float(v) for k, v in mean_scores.items()}, "rank_full_outer_train": [int(i) for i in full_rank]}
+
+    return full_rank[:best_k], {
+        "best_k": int(best_k),
+        "mean_auc_by_k": {int(k): float(v) for k, v in mean_scores.items()},
+        "rank_full_outer_train": [int(i) for i in full_rank]
+    }
 
 def stepB_pdi_selection_and_oof(best_model_name, data, woman_key, device, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     y_all = data[woman_key].y.view(-1).cpu().numpy().astype(int)
     y_torch = torch.as_tensor(y_all, dtype=torch.long, device=device)
     skf = StratifiedKFold(n_splits=CONFIG["OUTER_FOLDS"], shuffle=True, random_state=CONFIG["SEED"])
-    
+
     oof_probs_selected = np.zeros_like(y_all, dtype=float)
     selected_per_fold, diagnostics_per_fold = {}, {}
 
@@ -426,7 +492,9 @@ def stepB_pdi_selection_and_oof(best_model_name, data, woman_key, device, out_di
         set_seed(fold_seed)
         outer_safe = block_women_outgoing_edges(data, test_idx, woman_key)
 
-        selected_pdis, diag = pick_best_k_on_outer_train(best_model_name, outer_safe, woman_key, train_idx, y_all, device, fold_seed)
+        selected_pdis, diag = pick_best_k_on_outer_train(
+            best_model_name, outer_safe, woman_key, train_idx, y_all, device, fold_seed
+        )
         selected_per_fold[f"fold_{fold+1}"] = [int(i) for i in selected_pdis]
         diagnostics_per_fold[f"fold_{fold+1}"] = to_jsonable(diag)
         print(f"[Step B] Fold {fold+1}/{CONFIG['OUTER_FOLDS']}: selected k={len(selected_pdis)} PDIs -> {selected_pdis}")
@@ -434,16 +502,28 @@ def stepB_pdi_selection_and_oof(best_model_name, data, woman_key, device, out_di
         g = apply_pdi_mask_inplace(outer_safe, woman_key, selected_pdis).clone().to(device)
         model = build_model(best_model_name, g.metadata(), woman_key).to(device)
         oof_probs_selected[test_idx] = train_and_predict(model, g, train_idx, test_idx, y_torch, device, CONFIG["OUTER_EPOCHS"])
-        del model, g; cleanup()
+        del model, g
+        cleanup()
 
-    with open(os.path.join(out_dir, "stepB_selected_pdis_per_fold.json"), "w") as f: json.dump(to_jsonable(selected_per_fold), f, indent=2)
-    with open(os.path.join(out_dir, "stepB_selection_diagnostics.json"), "w") as f: json.dump(to_jsonable(diagnostics_per_fold), f, indent=2)
+    with open(os.path.join(out_dir, "stepB_selected_pdis_per_fold.json"), "w") as f:
+        json.dump(to_jsonable(selected_per_fold), f, indent=2)
+    with open(os.path.join(out_dir, "stepB_selection_diagnostics.json"), "w") as f:
+        json.dump(to_jsonable(diagnostics_per_fold), f, indent=2)
 
     counts = np.zeros(PDI_DIM, dtype=int)
     for sel in selected_per_fold.values():
-        for i in sel: counts[int(i)] += 1
+        for i in sel:
+            counts[int(i)] += 1
 
-    freq_df = pd.DataFrame({"pdi_index_0based": list(range(PDI_DIM)), "pdi_label": PDI_LABELS[:PDI_DIM], "selected_in_folds": counts, "selected_rate": counts / CONFIG["OUTER_FOLDS"]}).sort_values(["selected_in_folds", "pdi_index_0based"], ascending=[False, True])
+    freq_df = (
+        pd.DataFrame({
+            "pdi_index_0based": list(range(PDI_DIM)),
+            "pdi_label": PDI_LABELS[:PDI_DIM],
+            "selected_in_folds": counts,
+            "selected_rate": counts / CONFIG["OUTER_FOLDS"],
+        })
+        .sort_values(["selected_in_folds", "pdi_index_0based"], ascending=[False, True])
+    )
     freq_df.to_csv(os.path.join(out_dir, "stepB_pdi_selection_frequency.csv"), index=False)
 
     return y_all, oof_probs_selected, selected_per_fold, freq_df
@@ -454,7 +534,7 @@ def stepB_pdi_selection_and_oof(best_model_name, data, woman_key, device, out_di
 def main(graph_path, out_dir="final_pipeline_outputs", threshold_method="f1"):
     set_seed(CONFIG["SEED"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     raw = torch.load(graph_path, map_location="cpu", weights_only=False)
     data, woman_key = sanitize_and_fix_graph(raw)
 
@@ -465,11 +545,19 @@ def main(graph_path, out_dir="final_pipeline_outputs", threshold_method="f1"):
     print(f"\n[Step A] Best model by AUC: {best_model}")
     print(f"[Saved] Step A OOF predictions: {os.path.join(out_dir, 'stepA_oof_predictions.csv')}")
 
-    # === STEP A.1: DELONG TEST ===
+    # === STEP A.1: PAIRED PERMUTATION TEST ON OOF AUC DIFFERENCE ===
     top_2_models = stepA_table["model"].iloc[:2].tolist()
     if len(top_2_models) >= 2:
         m1, m2 = top_2_models
-        bootstrap_auc_difference(y_all_stepA, stepA_probs[m1], stepA_probs[m2], name1=m1, name2=m2)
+        paired_permutation_auc_test(
+            y_all_stepA,
+            stepA_probs[m1],
+            stepA_probs[m2],
+            name1=m1,
+            name2=m2,
+            n_perm=10000,
+            seed=CONFIG["SEED"]
+        )
 
     # === STEP B ===
     print("\n=== STEP B: PDI selection (inner-CV on outer-train; leakage-safe) ===")
@@ -485,7 +573,8 @@ def main(graph_path, out_dir="final_pipeline_outputs", threshold_method="f1"):
     metrics = summarize_at_threshold(y_true, oof_p_selected, thr)
 
     metrics_path = os.path.join(out_dir, "stepC_threshold_and_metrics.json")
-    with open(metrics_path, "w") as f: json.dump(to_jsonable(metrics), f, indent=2)
+    with open(metrics_path, "w") as f:
+        json.dump(to_jsonable(metrics), f, indent=2)
 
     print("\n=== STEP C: Threshold selection AFTER Step B (on OOF predictions) ===")
     print(f"Threshold method: {threshold_method}")

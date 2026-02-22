@@ -494,5 +494,5 @@ def main(graph_path, out_dir="final_pipeline_outputs", threshold_method="f1"):
     print(f"[Saved] Threshold+metrics: {metrics_path}")
 
 if __name__ == "__main__":
-    path = os.path.join(PTH, "graphRAG/data/perignnosis_graph.pt") if "PTH" in globals() else "perignnosis_graph.pt"
+    path = os.path.join(PTH, "graphRAG/data/periGNNosis_graph.pt") if "PTH" in globals() else "periGNNosis_graph.pt"
     main(path, out_dir="final_pipeline_outputs", threshold_method="f1")

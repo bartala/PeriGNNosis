@@ -36,11 +36,9 @@ def paired_permutation_test_auc(y_true, preds_A, preds_B, n_permutations=10000, 
     return {"auc_A": auc_A, "auc_B": auc_B, "diff_A_minus_B": obs_diff, "p_value": float(p_value)}
 
 # -----------------------------
-# Your configs (EDIT pdi_6 to match your paper!)
 # -----------------------------
 configs = {
     "PDI-13": list(range(13)),
-    # If your stable 6 items are Q1,Q2,Q6,Q10,Q12,Q13 -> 0-based [0,1,5,9,11,12]
     "PDI-6":  [0, 1, 2, 4, 11, 12],
 }
 
